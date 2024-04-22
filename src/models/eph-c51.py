@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch import distributions
 
 from src.config import config
 
@@ -196,8 +197,13 @@ class Network(nn.Module):
         self.hidden = None
 
         # dueling q structure
-        self.adv = nn.Linear(self.hidden_dim, 5)
-        self.state = nn.Linear(self.hidden_dim, 1)
+        # self.adv = nn.Linear(self.hidden_dim, 5)
+        # self.state = nn.Linear(self.hidden_dim, 1)
+
+        # Categorical C51 Q-network structure
+        self.num_atoms = 51  # Number of atoms in the categorical distribution
+        self.adv_cat = nn.Linear(self.hidden_dim, config.action_dim * self.num_atoms)
+        self.state_cat = nn.Linear(self.hidden_dim, self.num_atoms)
 
     @torch.no_grad()
     def step(self, obs, last_act, pos):
@@ -247,11 +253,28 @@ class Network(nn.Module):
             test_hidden = self.recurrent(test_latent, test_hidden)
             self.hidden = test_hidden[origin_agent_idx]
 
-            adv_val = self.adv(test_hidden)
-            state_val = self.state(test_hidden)
-            test_q_val = state_val + adv_val - adv_val.mean(1, keepdim=True)
-            test_actions = torch.argmax(test_q_val, 1)
+            # Dueling
+            # adv_val = self.adv(test_hidden)
+            # state_val = self.state(test_hidden)
+            # test_q_val = state_val + adv_val - adv_val.mean(1, keepdim=True)
+            # test_actions = torch.argmax(test_q_val, 1)
 
+            # Dueling end
+
+            dim = test_hidden.shape[0]
+            adv_val_logits = self.adv_cat(test_hidden).view(
+                dim, config.action_dim, self.num_atoms
+            )
+            adv_val_dist = distributions.Categorical(logits=adv_val_logits)
+            adv_val_cat = adv_val_dist.sample()
+
+            state_val_logits = self.state_cat(test_hidden).unsqueeze(1)
+            state_val_dist = F.softmax(state_val_logits, dim=-1)
+            state_val_cat = (state_val_dist * torch.arange(self.num_atoms)).sum(-1)
+            # Tensor to float
+            test_q_val_cat = (state_val_cat.float() + adv_val_cat.float() - adv_val_cat.float().mean(1, keepdim=True))
+            test_actions = torch.argmax(test_q_val_cat, 1)
+            # q_val = (state_val + adv_val - adv_val.mean(-1, keepdim=True))
             actions_mat = (
                 torch.ones((num_agents, num_agents), dtype=test_actions.dtype) * -1
             )
@@ -276,7 +299,6 @@ class Network(nn.Module):
             dist_mask = torch.zeros((num_agents, num_agents), dtype=torch.bool)
             dist_mask.scatter_(1, ranking, True)
             comm_mask = torch.bitwise_and(in_obs_mask, dist_mask)
-            # comm_mask[torch.arange(num_agents), torch.arange(num_agents)] = 0
 
             if self.hidden is None:
                 self.hidden = self.recurrent(latent)
@@ -290,13 +312,29 @@ class Network(nn.Module):
         )
         self.hidden = self.hidden.squeeze(0)
 
-        adv_val = self.adv(self.hidden)
-        state_val = self.state(self.hidden)
+        # # dueling q
+        # adv_val = self.adv(self.hidden)
+        # state_val = self.state(self.hidden)
 
-        q_val = state_val + adv_val - adv_val.mean(1, keepdim=True)
+        # q_val = state_val + adv_val - adv_val.mean(1, keepdim=True)
 
-        actions = torch.argmax(q_val, 1).tolist()
+        # actions = torch.argmax(q_val, 1).tolist()
+        # # dueling end
 
+        dim = self.hidden.shape[0]
+        adv_val_logits = self.adv_cat(self.hidden).view(
+            dim, config.action_dim, self.num_atoms
+        )
+        adv_val_dist = distributions.Categorical(logits=adv_val_logits)
+        adv_val_cat = adv_val_dist.sample()
+
+        state_val_logits = self.state_cat(self.hidden).unsqueeze(1)
+        state_val_dist = F.softmax(state_val_logits, dim=-1)
+        state_val_cat = (state_val_dist * torch.arange(self.num_atoms)).sum(-1)
+        # Tensor to float
+        q_val = (state_val_cat.float() + adv_val_cat.float() - adv_val_cat.float().mean(-1, keepdim=True))
+        actions = torch.argmax(q_val, 1)
+        # q_val = (state_val + adv_val - adv_val.mean(-1, keepdim=True))
         return (
             actions,
             q_val.numpy(),
@@ -309,7 +347,7 @@ class Network(nn.Module):
         self.hidden = None
 
     @torch.autocast(device_type="cuda")
-    def forward(self, obs, last_act, steps, hidden, relative_pos, comm_mask):
+    def forward2(self, obs, last_act, steps, hidden, relative_pos, comm_mask):
         """
         used for training
         """
@@ -337,12 +375,32 @@ class Network(nn.Module):
         # hidden buffer size: batch_size x seq_len x self.hidden_dim
         hidden_buffer = torch.stack(hidden_buffer).transpose(0, 1)
 
-        # hidden size: batch_size x self.hidden_dim
-        hidden = hidden_buffer[torch.arange(config.batch_size), steps - 1]
+        # # dueling q
+        # adv_val = self.adv(hidden)
+        # state_val = self.state(hidden)
 
-        adv_val = self.adv(hidden)
-        state_val = self.state(hidden)
+        # q_val = state_val + adv_val - adv_val.mean(1, keepdim=True)
+        # Dueling end
 
-        q_val = state_val + adv_val - adv_val.mean(1, keepdim=True)
+        dim = hidden.shape[0]
+        adv_val_logits = self.adv_cat(hidden).view(
+            dim, config.action_dim, self.num_atoms
+        )
+        adv_val_dist = distributions.Categorical(logits=adv_val_logits)
+        adv_val_cat = adv_val_dist.sample()
 
-        return q_val
+        state_val_logits = self.state_cat(hidden).unsqueeze(1)
+        state_val_dist = F.softmax(state_val_logits, dim=-1)
+        state_val_cat = (state_val_dist * torch.arange(self.num_atoms, device=state_val_logits.device)).sum(-1)
+        # Tensor to float
+
+        q_val = (state_val_cat.float() + adv_val_cat.float() - adv_val_cat.float().mean(-1, keepdim=True))
+
+        more_info = dict(
+            q_logits=adv_val_logits,
+        )
+
+        return q_val, more_info
+
+    def forward(self, *args, **kwargs):
+        return self.forward2(*args, **kwargs)[0]
