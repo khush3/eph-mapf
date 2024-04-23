@@ -203,7 +203,17 @@ class Network(nn.Module):
         # Categorical C51 Q-network structure
         self.num_atoms = 51  # Number of atoms in the categorical distribution
         self.adv_cat = nn.Linear(self.hidden_dim, config.action_dim * self.num_atoms)
-        self.state_cat = nn.Linear(self.hidden_dim, self.num_atoms)
+        # self.state_cat = nn.Linear(self.hidden_dim, self.num_atoms)
+        C51_vmin = -10
+        C51_vmax = 10
+        self.c51_support = torch.linspace(C51_vmin, C51_vmax, self.num_atoms).view(1, 1, self.num_atoms).to(self.adv_cat.weight.device) # Shape  1 x 1 x 51
+        self.c51_delta   = (C51_vmax - C51_vmin) / (self.num_atoms - 1)
+
+    def transform_q(self, logits):
+        # logits shape: batch_size x action_dim x num_atoms
+        # return shape: batch_size x action_dim
+        q_values = F.log_softmax(logits, dim=-1).exp() * self.c51_support.to(logits.device)
+        return q_values
 
     @torch.no_grad()
     def step(self, obs, last_act, pos):
@@ -265,15 +275,22 @@ class Network(nn.Module):
             adv_val_logits = self.adv_cat(test_hidden).view(
                 dim, config.action_dim, self.num_atoms
             )
-            adv_val_dist = distributions.Categorical(logits=adv_val_logits)
-            adv_val_cat = adv_val_dist.sample()
 
-            state_val_logits = self.state_cat(test_hidden).unsqueeze(1)
-            state_val_dist = F.softmax(state_val_logits, dim=-1)
-            state_val_cat = (state_val_dist * torch.arange(self.num_atoms)).sum(-1)
+            q_dist = self.transform_q(adv_val_logits) # batch_size x action_dim x num_atoms
+
+            test_q_val = q_dist.sum(-1) # batch_size x action_dim
+            test_actions = torch.argmax(test_q_val, 1)
+
+            # adv_val_dist = distributions.Categorical(logits=adv_val_logits)
+            # adv_val_cat = adv_val_dist.sample()
+
+            # state_val_logits = self.state_cat(test_hidden).unsqueeze(1)
+            # state_val_dist = F.softmax(state_val_logits, dim=-1)
+            # state_val_cat = (state_val_dist * torch.arange(self.num_atoms)).sum(-1)
             # Tensor to float
-            test_q_val_cat = (state_val_cat.float() + adv_val_cat.float() - adv_val_cat.float().mean(1, keepdim=True))
-            test_actions = torch.argmax(test_q_val_cat, 1)
+            # test_q_val_cat = (state_val_cat.float() + adv_val_cat.float() - adv_val_cat.float().mean(1, keepdim=True))
+            # test_q_val_cat = adv_val_cat.float()
+            # test_actions = torch.argmax(test_q_val_cat, 1)
             # q_val = (state_val + adv_val - adv_val.mean(-1, keepdim=True))
             actions_mat = (
                 torch.ones((num_agents, num_agents), dtype=test_actions.dtype) * -1
@@ -325,14 +342,9 @@ class Network(nn.Module):
         adv_val_logits = self.adv_cat(self.hidden).view(
             dim, config.action_dim, self.num_atoms
         )
-        adv_val_dist = distributions.Categorical(logits=adv_val_logits)
-        adv_val_cat = adv_val_dist.sample()
+        q_val = self.transform_q(adv_val_logits).sum(-1) # batch_size x action_dim
 
-        state_val_logits = self.state_cat(self.hidden).unsqueeze(1)
-        state_val_dist = F.softmax(state_val_logits, dim=-1)
-        state_val_cat = (state_val_dist * torch.arange(self.num_atoms)).sum(-1)
         # Tensor to float
-        q_val = (state_val_cat.float() + adv_val_cat.float() - adv_val_cat.float().mean(-1, keepdim=True))
         actions = torch.argmax(q_val, 1)
         # q_val = (state_val + adv_val - adv_val.mean(-1, keepdim=True))
         return (
@@ -386,15 +398,7 @@ class Network(nn.Module):
         adv_val_logits = self.adv_cat(hidden).view(
             dim, config.action_dim, self.num_atoms
         )
-        adv_val_dist = distributions.Categorical(logits=adv_val_logits)
-        adv_val_cat = adv_val_dist.sample()
-
-        state_val_logits = self.state_cat(hidden).unsqueeze(1)
-        state_val_dist = F.softmax(state_val_logits, dim=-1)
-        state_val_cat = (state_val_dist * torch.arange(self.num_atoms, device=state_val_logits.device)).sum(-1)
-        # Tensor to float
-
-        q_val = (state_val_cat.float() + adv_val_cat.float() - adv_val_cat.float().mean(-1, keepdim=True))
+        q_val = self.transform_q(adv_val_logits).sum(-1)
 
         more_info = dict(
             q_logits=adv_val_logits,

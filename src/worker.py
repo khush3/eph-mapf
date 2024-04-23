@@ -3,7 +3,6 @@ import random
 import subprocess
 import threading
 import time
-
 from copy import deepcopy
 from typing import Tuple
 
@@ -12,13 +11,12 @@ import ray
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import wandb
-
 from hydra.utils import instantiate
 from torch.cuda.amp import GradScaler
 from torch.optim import Adam
 from torch.optim.lr_scheduler import MultiStepLR
 
+import wandb
 from src.buffer import EpisodeData, LocalBuffer, SumTree
 from src.config import config
 from src.environment import Environment
@@ -495,34 +493,151 @@ class Learner:
 
             b_next_seq_len = b_seq_len + b_steps
 
+            BATCH_SIZE = b_reward.shape[0]
+            C51_atoms = 51
+            device = b_obs.device
+            GAMMA = b_gamma
+            NUM_LOOKAHEAD = 1
+            C51_vmin = -10
+            C51_vmax = 10
+            C51_support = torch.linspace(C51_vmin, C51_vmax, C51_atoms).view(1, 1, C51_atoms).to(device) # Shape  1 x 1 x 51
+            C51_delta   = (C51_vmax - C51_vmin) / (C51_atoms - 1)
+
+            def project_distribution():
+                """
+                This is for orignal C51, with KL-divergence.
+                """
+
+                def get_action_argmax_next_Q_sa():
+                    # if DOUBLE_Q_LEARNING:
+                    #     next_dist = policy_net(next_states) * C51_support      # Next_Distribution is of size: [batch x action x atoms]  
+                    # else:
+                    _, tar_info = self.tar_model.forward2(
+                        b_obs,
+                        b_last_act,
+                        b_next_seq_len,
+                        b_hidden,
+                        b_relative_pos,
+                        b_comm_mask,
+                    )
+                    next_action_logits = tar_info['q_logits']
+                    next_dist = F.softmax(next_action_logits, dim=-1)
+                    # next_dist = tar_model(next_states) * C51_support      # Next_Distribution is of size: [batch x action x atoms]  
+                    next_Q_sa = next_dist.sum(dim=2).max(1)[1]             # next_Q_sa is of size: [batch ] of action index 
+                    # print(next_Q_sa.shape, b_obs.size(0), b_obs.shape, b_reward.shape)
+                    next_Q_sa = next_Q_sa.view(b_reward.shape[0], 1, 1)  # Make it to be size of [32 x 1 x 1]
+                    next_Q_sa = next_Q_sa.expand(-1, -1, C51_atoms)        # Expand to be [32 x 1 x 51], one action, expand to support
+                    return next_Q_sa
+
+                with torch.no_grad():
+                    # max_next_dist = torch.zeros((BATCH_SIZE, 1, C51_atoms), device=device, dtype=torch.float)
+                    # max_next_dist += 1.0 / C51_atoms
+                    #
+                    max_next_action = get_action_argmax_next_Q_sa()
+                    _, tar_info = self.tar_model.forward2(
+                        b_obs,
+                        b_last_act,
+                        b_next_seq_len,
+                        b_hidden,
+                        b_relative_pos,
+                        b_comm_mask,
+                    )
+                    next_action_logits = tar_info['q_logits']
+                    next_dist = F.softmax(next_action_logits, dim=-1)
+                    max_next_dist = next_dist.gather(1, max_next_action)
+                    max_next_dist = max_next_dist.squeeze()
+                    #
+                    # Mapping
+                    Tz = b_reward.view(-1, 1) + (GAMMA**NUM_LOOKAHEAD) * C51_support.view(1, -1)
+                    Tz = Tz.clamp(C51_vmin, C51_vmax)
+                    C51_b = (Tz - C51_vmin) / C51_delta
+                    C51_L = C51_b.floor().to(torch.int64)
+                    C51_U = C51_b.ceil().to(torch.int64)
+                    C51_L[ (C51_U > 0)               * (C51_L == C51_U)] -= 1
+                    C51_U[ (C51_L < (C51_atoms - 1)) * (C51_L == C51_U)] += 1
+                    offset = torch.linspace(0, (BATCH_SIZE - 1) * C51_atoms, BATCH_SIZE)
+                    offset = offset.unsqueeze(dim=1) 
+                    offset = offset.expand(BATCH_SIZE, C51_atoms).to(b_action) # I believe this is to(device)
+
+                    # I believe this is analogous to torch.zeros(), but "new_zeros" keeps the type as the original tensor?
+                    m = torch.zeros(BATCH_SIZE, C51_atoms, device=b_obs.device) # Returns a Tensor of size size filled with 0. same dtype
+                    m.view(-1).index_add_(0, (C51_L + offset).view(-1), (max_next_dist * (C51_U.float() - C51_b)).view(-1))
+                    m.view(-1).index_add_(0, (C51_U + offset).view(-1), (max_next_dist * (C51_b - C51_L.float())).view(-1))
+                return m
+
+
+            # def project_distribution(next_action_probs, rewards, gamma, num_atoms=51):
+            #     # Project the distribution of returns for the next states
+            #     # Use the Bellman equation to compute the projected distribution
+
+            #     # Calculate projected values
+            #     projected_values = rewards.unsqueeze(1) + gamma.unsqueeze(1) * next_action_probs
+
+            #     # Clamp projected values
+            #     projected_values = torch.clamp(projected_values, 0, num_atoms - 1)
+
+            #     # Distribute projected values
+            #     lower_bounds = projected_values.floor().long()
+            #     upper_bounds = projected_values.ceil().long()
+
+            #     projected_distribution = torch.zeros_like(next_action_probs, dtype=torch.float32)
+
+            #     for i in range(num_atoms):
+            #         # projected_distribution.scatter_add_(1, lower_bounds + i, next_action_probs * (upper_bounds.float() - projected_values.float()))
+            #         # projected_distribution.scatter_add_(1, upper_bounds + i, next_action_probs * (projected_values.float() - lower_bounds.float()))
+
+            #         lower_bound_i = lower_bounds[..., i]
+            #         upper_bound_i = upper_bounds[..., i]
+
+            #         projected_distribution.scatter_add_(1, lower_bound_i.unsqueeze(2), next_action_probs * (upper_bound_i.float().unsqueeze(2) - projected_values.float()))
+            #         projected_distribution.scatter_add_(1, upper_bound_i.unsqueeze(2), next_action_probs * (projected_values.float() - lower_bound_i.float().unsqueeze(2)))
+
+                # return projected_distribution
+
+                # _, tar_info = self.tar_model.forward2(
+                #     b_obs,
+                #     b_last_act,
+                #     b_next_seq_len,
+                #     b_hidden,
+                #     b_relative_pos,
+                #     b_comm_mask,
+                # )
+                # # b_q_ = b_q_.max(1, keepdim=True)[0]
+
+            # next_action_logits = tar_info['q_logits']
+            # next_action_probs = F.softmax(next_action_logits, dim=-1)
+
             with torch.no_grad():
-                b_q_ = self.tar_model(
-                    b_obs,
-                    b_last_act,
-                    b_next_seq_len,
-                    b_hidden,
-                    b_relative_pos,
-                    b_comm_mask,
-                ).max(1, keepdim=True)[0]
+                target_prob = project_distribution()
 
-            target_q = b_reward + b_gamma * b_q_
+            C51_action   = b_action.unsqueeze(dim=-1).expand(-1, -1, 51)
 
-            b_q = self.model(
+            _, info = self.model.forward2(
                 b_obs[: -config.forward_steps],
                 b_last_act[: -config.forward_steps],
                 b_seq_len,
                 b_hidden,
                 b_relative_pos[:, : -config.forward_steps],
                 b_comm_mask[:, : -config.forward_steps],
-            ).gather(1, b_action)
+            )
+            # b_q = b_q.gather(1, b_action)
 
-            td_error = target_q - b_q
+            predicted_logits = info['q_logits']
+            predicted_probs = F.softmax(predicted_logits, dim=-1)
+
+            current_dist = predicted_probs.gather(1, C51_action).squeeze()
+            loss = -(target_prob * current_dist.log()).sum(-1) # KL Divergence
+
+            loss_PER = loss.detach().squeeze().abs()
+
+            # target_q = b_reward + b_gamma * b_q_
+            # td_error = target_q - b_q
 
             priorities = (
-                td_error.detach().clone().squeeze().abs().clamp(1e-6).cpu().numpy()
+                np.nan_to_num(loss_PER.clamp(1e-6).cpu().numpy())
             )
 
-            loss = F.mse_loss(b_q, target_q)
+            loss = loss.mean()
             self.loss += loss.item()
 
             self.optimizer.zero_grad()
